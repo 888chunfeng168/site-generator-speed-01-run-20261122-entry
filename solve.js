@@ -325,11 +325,6 @@ function isHr(line) {
   return onlySpaceTab(line, 3, line.length);
 }
 
-/** Whether `line` ends a paragraph: a blank line, a fence, a heading or a break. */
-function endsParagraph(line) {
-  return isBlank(line) || fenceLang(line) !== null || headingOf(line) !== null || isHr(line);
-}
-
 /** The first index from `from` where `s` holds `what` outside a backslash escape, or -1. */
 function findUnescaped(s, what, from, to) {
   const last = to - what.length;
@@ -459,6 +454,57 @@ function inlineRange(s, a, b, env, out) {
  * contents (every level 2 and 3 heading) and the excerpt (the first
  * paragraph's inline HTML, or "").
  */
+// Line kinds for classifyLine: 0 blank, 1 fence, 2 heading, 3 hr, 4 quote, 5 bullet, 6 ordered, 7 text.
+function classifyLine(line, c) {
+  if (line.length === 0) { c.kind = 0; return 0; }
+  const ch0 = line.charCodeAt(0);
+  if (ch0 === 32 || ch0 === 9) {
+    c.kind = isBlank(line) ? 0 : 7;
+    return c.kind;
+  }
+  if (ch0 === 96) { // `
+    const lang = fenceLang(line);
+    if (lang !== null) { c.kind = 1; c.lang = lang; return 1; }
+    c.kind = 7;
+    return 7;
+  }
+  if (ch0 === 35) { // #
+    const h = headingOf(line);
+    if (h !== null) { c.kind = 2; c.depth = h.depth; c.text = h.text; return 2; }
+    c.kind = 7;
+    return 7;
+  }
+  if (ch0 === 45 || ch0 === 42) { // - or *
+    if (isHr(line)) { c.kind = 3; return 3; }
+    if (line.charCodeAt(1) === 32) { c.kind = 5; c.rest = line.slice(2); return 5; }
+    c.kind = 7;
+    return 7;
+  }
+  if (ch0 === 62) { c.kind = 4; return 4; } // >
+  if (ch0 >= 48 && ch0 <= 57) {
+    let d = 0;
+    while (d < line.length && line[d] >= '0' && line[d] <= '9') d++;
+    if (d >= 1 && d <= 9 && line[d] === '.' && line[d + 1] === ' ') {
+      c.kind = 6;
+      c.start = Number(line.slice(0, d));
+      c.rest = line.slice(d + 2);
+      return 6;
+    }
+    c.kind = 7;
+    return 7;
+  }
+  c.kind = 7;
+  return 7;
+}
+
+/**
+ * `src` rendered in one fused pass: blocks are recognised and rendered as
+ * they are scanned, straight into `out`. Each line is classified once and
+ * the classification carries over: a paragraph keeps consuming lines until
+ * the pending line's kind is one that ends it. Returns the HTML, the table
+ * of contents (every level 2 and 3 heading) and the excerpt (the first
+ * paragraph's inline HTML, or "").
+ */
 function renderMarkdown(src, env, cx) {
   const out = [];
   const toc = [];
@@ -466,71 +512,68 @@ function renderMarkdown(src, env, cx) {
   const idNext = new Map();
   let excerpt = null;
   const len = src.length;
+  const c = {};
   let pos = 0;
-  while (pos <= len) {
+  let curLine = null;
+  let curKind = -1;
+  // Read the next line into curLine/curKind (classified once); false at EOF.
+  const advance = () => {
+    if (pos > len) {
+      curLine = null;
+      return false;
+    }
     let nl = src.indexOf('\n', pos);
     if (nl === -1) nl = len;
-    let line = src.slice(pos, nl);
-    let next = nl === len ? len + 1 : nl + 1;
-    if (isBlank(line)) {
-      pos = next;
+    curLine = src.slice(pos, nl);
+    pos = nl === len ? len + 1 : nl + 1;
+    curKind = classifyLine(curLine, c);
+    return true;
+  };
+  advance();
+  while (curLine !== null) {
+    const kind = curKind;
+    if (kind === 0) {
+      advance();
       continue;
     }
-    const lang = fenceLang(line);
-    if (lang !== null) {
-      const cls = lang === '' ? '' : ` class="language-${escapeHtml(lang)}"`;
+    if (kind === 1) {
+      const cls = c.lang === '' ? '' : ` class="language-${escapeHtml(c.lang)}"`;
       out.push(`<pre><code${cls}>`);
-      pos = next;
-      for (;;) {
-        if (pos > len) break;
-        nl = src.indexOf('\n', pos);
-        if (nl === -1) nl = len;
-        const bodyLine = src.slice(pos, nl);
-        const after = nl === len ? len + 1 : nl + 1;
-        if (isFenceClose(bodyLine)) {
-          pos = after;
-          break;
-        }
-        out.push(escapeHtml(bodyLine), '\n');
-        pos = after;
+      advance();
+      while (curLine !== null && !isFenceClose(curLine)) {
+        out.push(escapeHtml(curLine), '\n');
+        advance();
       }
+      if (curLine !== null) advance(); // skip the closing fence line
       out.push('</code></pre>', '\n');
       continue;
     }
-    const heading = headingOf(line);
-    if (heading !== null) {
-      const id = uniqueSlug(slugify(heading.text, cx.slugCache), ids, idNext);
+    if (kind === 2) {
+      const id = uniqueSlug(slugify(c.text, cx.slugCache), ids, idNext);
       const mark = out.length;
-      out.push(`<h${heading.depth} id="${id}">`);
-      inlineRange(heading.text, 0, heading.text.length, env, out);
-      out.push(`</h${heading.depth}>`, '\n');
-      if (heading.depth === 2 || heading.depth === 3) {
-        toc.push({ level: heading.depth, id, html: out.slice(mark + 1, out.length - 2).join('') });
+      out.push(`<h${c.depth} id="${id}">`);
+      inlineRange(c.text, 0, c.text.length, env, out);
+      out.push(`</h${c.depth}>`, '\n');
+      if (c.depth === 2 || c.depth === 3) {
+        toc.push({ level: c.depth, id, html: out.slice(mark + 1, out.length - 2).join('') });
       }
-      pos = next;
+      advance();
       continue;
     }
-    if (isHr(line)) {
+    if (kind === 3) {
       out.push('<hr>', '\n');
-      pos = next;
+      advance();
       continue;
     }
-    if (line[0] === '>') {
+    if (kind === 4) {
       const lines = [];
-      for (;;) {
+      while (curLine !== null && curKind === 4) {
         // drop the '>' and one space after it, then trim
-        let t = line.slice(1);
+        let t = curLine.slice(1);
         if (t[0] === ' ') t = t.slice(1);
         t = trimLine(t);
         if (t !== '') lines.push(t);
-        pos = next;
-        if (pos > len) break;
-        nl = src.indexOf('\n', pos);
-        if (nl === -1) nl = len;
-        const l2 = src.slice(pos, nl);
-        if (l2[0] !== '>') break;
-        line = l2;
-        next = nl === len ? len + 1 : nl + 1;
+        advance();
       }
       if (lines.length === 0) {
         out.push('<blockquote>\n</blockquote>', '\n');
@@ -542,41 +585,28 @@ function renderMarkdown(src, env, cx) {
       }
       continue;
     }
-    const bullet = line[0] === '-' || line[0] === '*' ? (line[1] === ' ' ? line.slice(2) : null) : null;
-    let ordered = null;
-    if (bullet === null) {
-      let d = 0;
-      while (d < line.length && line[d] >= '0' && line[d] <= '9') d++;
-      if (d >= 1 && d <= 9 && line[d] === '.' && line[d + 1] === ' ') ordered = { start: Number(line.slice(0, d)), rest: line.slice(d + 2) };
-    }
-    if (bullet !== null || ordered !== null) {
-      const isOrdered = ordered !== null;
-      const items = [[trimLine(isOrdered ? ordered.rest : bullet)]];
-      pos = next;
-      for (;;) {
-        if (pos > len) break;
-        nl = src.indexOf('\n', pos);
-        if (nl === -1) nl = len;
-        const l2 = src.slice(pos, nl);
-        const after = nl === len ? len + 1 : nl + 1;
+    if (kind === 5 || kind === 6) {
+      const isOrdered = kind === 6;
+      const start = isOrdered ? c.start : 1;
+      const items = [[trimLine(c.rest)]];
+      advance();
+      while (curLine !== null) {
         let m = null;
         if (isOrdered) {
-          let d = 0;
-          while (d < l2.length && l2[d] >= '0' && l2[d] <= '9') d++;
-          if (d >= 1 && d <= 9 && l2[d] === '.' && l2[d + 1] === ' ') m = l2.slice(d + 2);
-        } else if ((l2[0] === '-' || l2[0] === '*') && l2[1] === ' ') {
-          m = l2.slice(2);
+          if (curKind === 6) m = c.rest;
+        } else if (curKind === 5) {
+          m = c.rest;
         }
         if (m !== null) {
           items.push([trimLine(m)]);
-          pos = after;
-        } else if (/^ {2,}\S/.test(l2)) {
-          items[items.length - 1].push(trimLine(l2));
-          pos = after;
+          advance();
+        } else if (/^ {2,}\S/.test(curLine)) {
+          items[items.length - 1].push(trimLine(curLine));
+          advance();
         } else break;
       }
       const tag = isOrdered ? 'ol' : 'ul';
-      const open = isOrdered && ordered.start !== 1 ? `<ol start="${ordered.start}">` : `<${tag}>`;
+      const open = isOrdered && start !== 1 ? `<ol start="${start}">` : `<${tag}>`;
       out.push(`${open}\n`);
       for (const item of items) {
         const joined = item.join('\n');
@@ -588,16 +618,11 @@ function renderMarkdown(src, env, cx) {
       continue;
     }
     // paragraph: this line and the following ones up to a blank line, a fence, a heading or a break
-    const pLines = [trimLine(line)];
-    pos = next;
-    for (;;) {
-      if (pos > len) break;
-      nl = src.indexOf('\n', pos);
-      if (nl === -1) nl = len;
-      const l2 = src.slice(pos, nl);
-      if (endsParagraph(l2)) break;
-      pLines.push(trimLine(l2));
-      pos = nl === len ? len + 1 : nl + 1;
+    const pLines = [trimLine(curLine)];
+    advance();
+    while (curLine !== null && curKind !== 0 && curKind !== 1 && curKind !== 2 && curKind !== 3) {
+      pLines.push(trimLine(curLine));
+      advance();
     }
     const joined = pLines.join('\n');
     const mark = out.length;
